@@ -1190,6 +1190,7 @@ struct ModuleWithRelocations<'a> {
     module: Module,
     symbols: Vec<SymbolInfo<'a>>,
     names_to_funcs: HashMap<String, FunctionId>,
+    funcs_by_index: Vec<FunctionId>,
     call_graph: HashMap<Node, HashSet<Node>>,
     parents: HashMap<Node, HashSet<Node>>,
     relocation_map: HashMap<Node, Vec<RelocationEntry>>,
@@ -1199,7 +1200,34 @@ struct ModuleWithRelocations<'a> {
 
 impl<'a> ModuleWithRelocations<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self> {
-        let module = Module::from_buffer(bytes)?;
+        // The linking section's own symbol table (what relocations index
+        // into) assigns each function symbol a raw wasm function *index*,
+        // independently of whatever name (if any) ended up in the "name"
+        // custom section for that same function. For weak/COMDAT-merged
+        // symbols - exactly the shared std/core functions relocations
+        // often point at - the two can disagree or the name section can
+        // be missing an entry entirely, even with debug info enabled.
+        // `funcs_by_index` mirrors `parse_module_with_ids` below to give
+        // `get_symbol_dep_node` a name-independent way to resolve them.
+        let funcs_by_index = Arc::new(RwLock::new(Vec::new()));
+        let funcs_by_index_ = funcs_by_index.clone();
+        let module = Module::from_buffer_with_config(
+            bytes,
+            ModuleConfig::new().on_parse(move |_m, our_ids| {
+                let mut out = funcs_by_index_.write().expect("No shared writers");
+                let mut idx = 0;
+                while let Ok(entry) = our_ids.get_func(idx) {
+                    out.push(entry);
+                    idx += 1;
+                }
+                Ok(())
+            }),
+        )?;
+        let funcs_by_index = Arc::try_unwrap(funcs_by_index)
+            .expect("on_parse callback has finished, no other references remain")
+            .into_inner()
+            .expect("No shared writers");
+
         let raw_data = parse_bytes_to_data_segment(bytes)?;
         let names_to_funcs = module
             .funcs
@@ -1213,6 +1241,7 @@ impl<'a> ModuleWithRelocations<'a> {
             data_section_range: raw_data.data_range,
             symbols: raw_data.symbols,
             names_to_funcs,
+            funcs_by_index,
             call_graph: Default::default(),
             relocation_map: Default::default(),
             parents: Default::default(),
@@ -1325,25 +1354,39 @@ impl<'a> ModuleWithRelocations<'a> {
     fn get_symbol_dep_node(&self, index: usize) -> Result<Option<Node>> {
         let res = match self.symbols[index] {
             SymbolInfo::Data { .. } => Some(Node::DataSymbol(index)),
-            SymbolInfo::Func { name, .. } => Some(Node::Function({
-                let name = name.context(
-                    "Function symbol has no name - did you forget to enable debug symbols",
-                )?;
+            SymbolInfo::Func {
+                index: func_index,
+                name,
+                ..
+            } => Some(Node::Function({
+                // The linking section's symbol table gives every function
+                // symbol a raw wasm function index directly - use that
+                // first. It's authoritative and doesn't depend on the
+                // (separately populated, sometimes incomplete for
+                // weak/COMDAT-merged symbols like shared core::fmt
+                // functions) "name" custom section agreeing on a name.
+                let by_index = self.funcs_by_index.get(func_index as usize).copied();
 
-                let func_id = self.names_to_funcs.get(name);
-
-                // wbindgen will synthesize some functions that don't exist in the original module (eg describe functions)
-                // Previously this was a hard error, but now we just ignore it. It used to mean that the user
-                let Some(res) = func_id else {
-                    if !name.contains("__wbindgen_") {
-                        tracing::error!(
-                            "Could not find function symbol {name:?} in module - was this built with LTO, --emit-relocs, and debug symbols? Ignoring."
-                        );
+                let res = match by_index.or_else(|| {
+                    name.and_then(|name| self.names_to_funcs.get(name).copied())
+                }) {
+                    Some(res) => res,
+                    None => {
+                        let name = name.context(
+                            "Function symbol has no name - did you forget to enable debug symbols",
+                        )?;
+                        // wbindgen will synthesize some functions that don't exist in the original module (eg describe functions)
+                        // Previously this was a hard error, but now we just ignore it. It used to mean that the user
+                        if !name.contains("__wbindgen_") {
+                            tracing::error!(
+                                "Could not find function symbol {name:?} in module - was this built with LTO, --emit-relocs, and debug symbols? Ignoring."
+                            );
+                        }
+                        return Ok(None);
                     }
-                    return Ok(None);
                 };
 
-                *res
+                res
             })),
 
             _ => None,
