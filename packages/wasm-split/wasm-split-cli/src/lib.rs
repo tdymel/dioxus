@@ -1188,6 +1188,7 @@ struct ModuleWithRelocations<'a> {
     module: Module,
     symbols: Vec<SymbolInfo<'a>>,
     names_to_funcs: HashMap<String, FunctionId>,
+    funcs_by_index: Vec<FunctionId>,
     call_graph: HashMap<Node, HashSet<Node>>,
     parents: HashMap<Node, HashSet<Node>>,
     relocation_map: HashMap<Node, Vec<RelocationEntry>>,
@@ -1197,7 +1198,12 @@ struct ModuleWithRelocations<'a> {
 
 impl<'a> ModuleWithRelocations<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self> {
-        let module = Module::from_buffer(bytes)?;
+        // The linking section's symbol table (what relocations index into) gives every function
+        // symbol a raw wasm function index, independently of whatever name - if any - the "name"
+        // custom section carries for that same function, so keep the index mapping around for
+        // `get_symbol_dep_node` to resolve symbols by.
+        let (module, funcs_by_index, _) = parse_module_with_ids(bytes)?;
+
         let raw_data = parse_bytes_to_data_segment(bytes)?;
         let names_to_funcs = module
             .funcs
@@ -1211,6 +1217,7 @@ impl<'a> ModuleWithRelocations<'a> {
             data_section_range: raw_data.data_range,
             symbols: raw_data.symbols,
             names_to_funcs,
+            funcs_by_index,
             call_graph: Default::default(),
             relocation_map: Default::default(),
             parents: Default::default(),
@@ -1323,26 +1330,38 @@ impl<'a> ModuleWithRelocations<'a> {
     fn get_symbol_dep_node(&self, index: usize) -> Result<Option<Node>> {
         let res = match self.symbols[index] {
             SymbolInfo::Data { .. } => Some(Node::DataSymbol(index)),
-            SymbolInfo::Func { name, .. } => Some(Node::Function({
-                let name = name.context(
-                    "Function symbol has no name - did you forget to enable debug symbols",
-                )?;
-
-                let func_id = self.names_to_funcs.get(name);
+            SymbolInfo::Func {
+                index: func_index,
+                name,
+                ..
+            } => {
+                // Prefer the symbol's own function index over its name: the index is
+                // authoritative, while the "name" custom section is populated separately and is
+                // often incomplete for the weak/COMDAT-merged symbols relocations point at.
+                let func_id = self
+                    .funcs_by_index
+                    .get(func_index as usize)
+                    .copied()
+                    .or_else(|| name.and_then(|name| self.names_to_funcs.get(name).copied()));
 
                 // wbindgen will synthesize some functions that don't exist in the original module (eg describe functions)
                 // Previously this was a hard error, but now we just ignore it. It used to mean that the user
-                let Some(res) = func_id else {
+                let Some(func_id) = func_id else {
+                    let name = name.context(
+                        "Function symbol has no name - did you forget to enable debug symbols",
+                    )?;
+
                     if !name.contains("__wbindgen_") {
                         tracing::error!(
                             "Could not find function symbol {name:?} in module - was this built with LTO, --emit-relocs, and debug symbols? Ignoring."
                         );
                     }
+
                     return Ok(None);
                 };
 
-                *res
-            })),
+                Some(Node::Function(func_id))
+            }
 
             _ => None,
         };
