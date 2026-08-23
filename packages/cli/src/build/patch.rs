@@ -666,7 +666,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
 
         if name_is_bindgen_symbol(&name) {
             new.imports.delete(env_func_import);
-            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, 0, name);
+            stub_out_bindgen_describe_fn(&mut new, func_id, name);
             continue;
         }
 
@@ -687,7 +687,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         if name_is_bindgen_symbol(&import.name) {
             let name = import.name.as_str().to_string();
             new.imports.delete(import_id);
-            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, 0, name);
+            stub_out_bindgen_describe_fn(&mut new, func_id, name);
         }
     }
 
@@ -811,6 +811,47 @@ fn convert_func_to_ifunc_call(
         ty: ty_id,
         table: ifunc_table_initializer,
     }));
+
+    new.funcs.get_mut(func_id).kind = FunctionKind::Local(builder.local_func(locals));
+}
+
+/// Replace a wasm-bindgen "describe" intrinsic (whatever `name_is_bindgen_symbol` matches) with an
+/// inert local function that just returns zeroed results.
+///
+/// These exist only for wasm-bindgen's build-time interpreter to read type signatures out of, and
+/// are stripped before the module ships - they're never meant to run, and nothing reads what they
+/// return. `prepare_wasm_base_module` also never promotes them into the ifunc table, so unlike
+/// [`convert_func_to_ifunc_call`]'s other callers there is no table index to route them through:
+/// the hardcoded index `0` this used to pass called whatever function occupies that slot in the
+/// *old* module, tripping a `null function or function signature mismatch` trap - or silently
+/// calling the wrong function, if slot `0`'s type happened to match.
+fn stub_out_bindgen_describe_fn(new: &mut Module, func_id: FunctionId, name: String) {
+    use walrus::{ValType, ir};
+
+    let ty_id = new.funcs.get(func_id).ty();
+    let ty = new.types.get(ty_id);
+    let params = ty.params().to_vec();
+    let results = ty.results().to_vec();
+    let locals: Vec<_> = params.iter().map(|ty| new.locals.add(*ty)).collect();
+
+    let mut builder = FunctionBuilder::new(&mut new.types, &params, &results);
+    let mut body = builder.name(name).func_body();
+
+    for result_ty in &results {
+        let value = match result_ty {
+            ValType::I32 => ir::Value::I32(0),
+            ValType::I64 => ir::Value::I64(0),
+            ValType::F32 => ir::Value::F32(0.0),
+            ValType::F64 => ir::Value::F64(0.0),
+            ValType::V128 => ir::Value::V128(0),
+            ValType::Ref(ref_ty) => {
+                body.instr(ir::Instr::RefNull(ir::RefNull { ty: *ref_ty }));
+                continue;
+            }
+        };
+
+        body.instr(ir::Instr::Const(ir::Const { value }));
+    }
 
     new.funcs.get_mut(func_id).kind = FunctionKind::Local(builder.local_func(locals));
 }
